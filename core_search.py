@@ -116,6 +116,106 @@ def search(term, gz, joinonly, offset, ftitle="", fshelf="", flib="", fplace="",
     con.close()
     return {"total": total, "rows": out, "offset": offset, "limit": limit}
 
+# ------------------------------------------------------------ manifest pages
+# The FL numbers in the `images` table come out of NLI's file exports. They are
+# the INTERNAL series: they match the filenames on the HPC server, and IIIF
+# refuses to serve them. The servable FLs exist only inside the IIIF manifest.
+#
+# `manifest_images` holds the ones the bulk harvest has collected so far. For a
+# manuscript the harvest has not reached yet, we fetch its manifest once, on
+# first view, store what comes back, and serve from the table afterwards.
+import time, datetime
+
+MANIFEST_URL   = "https://iiif.nli.org.il/IIIFv21/DOCID/PNX_MANUSCRIPTS%s-%d/manifest"
+MANIFEST_UA    = "MiDRASH-Core/0.1 (Tel Aviv University; avichaile@tauex.tau.ac.il)"
+MANIFEST_PARTS = 12     # most manuscripts have one; a few have several scannings
+MANIFEST_TIMEOUT = 8    # seconds per request
+MANIFEST_BUDGET  = 20   # seconds for the whole manuscript, so a page never hangs
+
+
+def _manifest_parse(man):
+    """One manifest -> [(ie, seq_no, canvas_no, label, fl), ...]"""
+    rows = []
+    for si, seq in enumerate(man.get("sequences", []) or []):
+        m = re.search(r"(IE\d+)", seq.get("@id", "") or "")
+        ie = m.group(1) if m else None
+        for ci, cv in enumerate(seq.get("canvases", []) or []):
+            label = cv.get("label")
+            if isinstance(label, list): label = label[0] if label else None
+            if isinstance(label, dict): label = label.get("@value")
+            mm = re.search(r"(FL\d+)", cv.get("@id", "") or "")
+            if not mm:
+                mm = re.search(r"(FL\d+)", json.dumps(cv.get("images", [])))
+            rows.append((ie, si + 1, ci + 1, label, mm.group(1) if mm else None))
+    return rows
+
+
+def manifest_fetch(alma):
+    """Every part of one manuscript's manifest. [] if NLI has nothing or is
+    unreachable. Never raises, never runs longer than MANIFEST_BUDGET."""
+    out, deadline = [], time.monotonic() + MANIFEST_BUDGET
+    for part in range(1, MANIFEST_PARTS + 1):
+        if time.monotonic() > deadline:
+            break
+        req = urllib.request.Request(MANIFEST_URL % (alma, part),
+                                     headers={"User-Agent": MANIFEST_UA})
+        try:
+            with urllib.request.urlopen(req, timeout=MANIFEST_TIMEOUT) as r:
+                man = json.loads(r.read().decode("utf-8", "replace"))
+        except Exception:
+            break
+        rows = _manifest_parse(man)
+        if not rows:
+            break
+        out.extend(rows)
+    return out
+
+
+def _manifest_stored(c, alma):
+    return [dict(r) for r in c.execute(
+        "SELECT ie,seq_no,canvas_no,label,fl FROM manifest_images "
+        "WHERE alma=? ORDER BY seq_no, canvas_no", (alma,))]
+
+
+def manifest_pages(alma, c):
+    """Servable FLs for one manuscript, fetching and storing them on first view
+    if the harvest has not reached it yet."""
+    if not alma:
+        return []
+    try:
+        c.execute("""CREATE TABLE IF NOT EXISTS manifest_images (
+            alma TEXT, ie TEXT, seq_no INTEGER, canvas_no INTEGER,
+            label TEXT, fl TEXT)""")
+        rows = _manifest_stored(c, alma)
+    except Exception:
+        return []
+    if rows:
+        return rows
+
+    fetched = manifest_fetch(alma)
+    if not fetched:
+        return []
+
+    try:
+        # another request may have stored the same manuscript while we waited
+        if _manifest_stored(c, alma):
+            return _manifest_stored(c, alma)
+        c.executemany("INSERT INTO manifest_images VALUES (?,?,?,?,?,?)",
+                      [(alma,) + r for r in fetched])
+        c.execute("""CREATE TABLE IF NOT EXISTS harvest_log (
+            alma TEXT PRIMARY KEY, status TEXT, n_canvases INTEGER,
+            n_seqs INTEGER, detail TEXT, fetched_at TEXT)""")
+        c.execute("INSERT OR REPLACE INTO harvest_log VALUES (?,?,?,?,?,?)",
+                  (alma, "ok", len(fetched), len({r[1] for r in fetched}),
+                   "on demand", datetime.datetime.now().isoformat(" ", "seconds")))
+        c.connection.commit()
+    except Exception:
+        pass
+
+    return [{"ie": r[0], "seq_no": r[1], "canvas_no": r[2],
+             "label": r[3], "fl": r[4]} for r in fetched]
+
+
 def detail(alma):
     con = connect(); c = con.cursor()
     m = c.execute("SELECT * FROM manuscripts WHERE alma=?", (alma,)).fetchone()
@@ -129,6 +229,10 @@ def detail(alma):
     d["scans"] = [dict(r) for r in c.execute("SELECT ie,scan_type,image_count FROM scans WHERE alma=?", (alma,))]
     d["images"] = [dict(r) for r in c.execute(
         "SELECT fl,folio_label,fgp_scan FROM images WHERE alma=? LIMIT 12", (alma,))]
+    try:
+        d["pages"] = manifest_pages(alma, c)
+    except Exception:
+        d["pages"] = []
     d["joins"] = [dict(r) for r in c.execute("""
         SELECT DISTINCT j.join_id, j.join_type, j.scholar, j.confidence
         FROM join_members jm JOIN joins j ON j.join_id=jm.join_id WHERE jm.alma=?""", (alma,))]
@@ -257,7 +361,8 @@ async function openMs(alma){
  document.querySelectorAll('tr.r').forEach(t=>t.classList.toggle('sel',t.dataset.a===alma));
  const d=await (await fetch('/ms?alma='+encodeURIComponent(alma))).json();
  const kv=(k,v)=>v?`<div class="kv"><b>${k}:</b> ${esc(v)}</div>`:'';
- const fl=(d.images&&d.images[0])?d.images[0].fl:null;
+ const pg=(d.pages||[]).filter(function(p){return p.fl;});
+ const fl=pg.length?pg[0].fl:((d.images&&d.images[0])?d.images[0].fl:null);
  const imgHtml=fl?`<div class="img"><a href="https://nli-proxy.avichai-levy.workers.dev/IIIFv21/${fl}/full/max/0/default.jpg" target="_blank" rel="noopener"><img loading="lazy" referrerpolicy="no-referrer" src="${IIIF(fl)}" onerror="this.closest('.img').innerHTML='<div class=empty style=padding:20px>image restricted by the NLI — not available for display</div>'"></a></div>`:'';
  document.getElementById('detail').innerHTML=`<h2 class="heb">${esc(d.shelfmark||d.alma)}</h2>
   <div class="kv heb">${esc(d.title||'')}</div>
@@ -273,7 +378,9 @@ async function openMs(alma){
   ${kv('Extent',d.extent)}${kv('Dimensions',d.dimensions)}${kv('Material',d.material_notes)}${kv('People',d.persons)}${kv('Provenance',d.provenance)}
   <div class="k">Scans (${d.scans.length})</div>
   ${d.scans.map(s=>`<div class="kv mono">${esc(s.ie)} · ${esc(s.scan_type||'?')} · ${s.image_count||'?'} img</div>`).join('')||'<div class=muted>—</div>'}
-  <div class="k">Images (first ${d.images.length})</div>
+  <div class="k">Pages${pg.length?' ('+pg.length+')':''}</div>
+  ${pg.length?pg.slice(0,12).map(function(p){return '<div class="kv mono">'+esc(p.fl)+' '+esc(p.label||'')+'</div>';}).join('')+(pg.length>12?'<div class="kv muted">and '+(pg.length-12)+' more</div>':''):'<div class=muted>no IIIF manifest</div>'}
+  <div class="k">File numbers in the NLI export (first ${d.images.length})</div>
   ${d.images.map(i=>`<div class="kv mono">${esc(i.fl)} ${esc(i.folio_label||'')} ${i.fgp_scan?'· '+esc(i.fgp_scan):''}</div>`).join('')||'<div class=muted>—</div>'}
   <div class="k">Joins (${d.joins.length})</div>
   ${d.joins.map(j=>{const clean=v=>{v=esc(v||'');return /^NULL$/i.test(v)?'':v;};const bits=['join '+esc(j.join_id)];[clean(j.join_type),clean(j.scholar),clean(j.confidence)].forEach(x=>{if(x)bits.push(x);});return `<div class="kv">${bits.join(' · ')}</div>`;}).join('')||'<div class=muted>none</div>'}
