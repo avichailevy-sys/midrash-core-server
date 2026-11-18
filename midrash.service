@@ -1,0 +1,12 @@
+[Unit]
+Description=MiDRASH Core
+After=network.target
+
+[Service]
+WorkingDirectory=/root/midrash_core
+ExecStart=/usr/bin/python3 /root/midrash_core/core_search.py /root/midrash_core/midrash_core.db
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
