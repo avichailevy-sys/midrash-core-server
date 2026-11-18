@@ -3,3 +3,5 @@
 !*.py
 !*.md
 !*.service
+!data/
+!data/vatican_almas.tsv
